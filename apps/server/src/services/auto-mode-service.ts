@@ -16,6 +16,8 @@ import {
   isAbortError,
   classifyError,
   loadContextFiles,
+  appendLearning,
+  recordMemoryUsage,
 } from '@automaker/utils';
 import { resolveModelString, DEFAULT_MODELS } from '@automaker/model-resolver';
 import { resolveDependencies, areDependenciesSatisfied } from '@automaker/dependency-resolver';
@@ -311,6 +313,8 @@ export class AutoModeService {
       projectPath,
     });
 
+    // Note: Memory folder initialization is now handled by loadContextFiles
+
     // Run the loop in the background
     this.runAutoLoop().catch((error) => {
       console.error('[AutoMode] Loop error:', error);
@@ -504,7 +508,8 @@ export class AutoModeService {
 
       // Build the prompt - use continuation prompt if provided (for recovery after plan approval)
       let prompt: string;
-      // Load project context files (CLAUDE.md, CODE_QUALITY.md, etc.) - passed as system prompt
+      // Load project context files (CLAUDE.md, CODE_QUALITY.md, etc.) and memory files
+      // Context loader now automatically includes memory from .automaker/memory/
       const contextResult = await loadContextFiles({
         projectPath,
         fsModule: secureFs as Parameters<typeof loadContextFiles>[0]['fsModule'],
@@ -512,7 +517,8 @@ export class AutoModeService {
 
       // When autoLoadClaudeMd is enabled, filter out CLAUDE.md to avoid duplication
       // (SDK handles CLAUDE.md via settingSources), but keep other context files like CODE_QUALITY.md
-      const contextFilesPrompt = filterClaudeMdFromContext(contextResult, autoLoadClaudeMd);
+      // Note: contextResult.formattedPrompt now includes both context AND memory
+      const combinedSystemPrompt = filterClaudeMdFromContext(contextResult, autoLoadClaudeMd);
 
       if (options?.continuationPrompt) {
         // Continuation prompt is used when recovering from a plan approval
@@ -558,7 +564,7 @@ export class AutoModeService {
           projectPath,
           planningMode: feature.planningMode,
           requirePlanApproval: feature.requirePlanApproval,
-          systemPrompt: contextFilesPrompt || undefined,
+          systemPrompt: combinedSystemPrompt || undefined,
           autoLoadClaudeMd,
         }
       );
@@ -588,6 +594,36 @@ export class AutoModeService {
 
       // Record success to reset consecutive failure tracking
       this.recordSuccess();
+
+      // Record learnings and memory usage after successful feature completion
+      try {
+        const featureDir = getFeatureDir(projectPath, featureId);
+        const outputPath = path.join(featureDir, 'agent-output.md');
+        let agentOutput = '';
+        try {
+          const outputContent = await secureFs.readFile(outputPath, 'utf-8');
+          agentOutput =
+            typeof outputContent === 'string' ? outputContent : outputContent.toString();
+        } catch {
+          // Agent output might not exist yet
+        }
+
+        // Record memory usage if we loaded any memory files
+        if (contextResult.memoryFiles.length > 0 && agentOutput) {
+          await recordMemoryUsage(
+            projectPath,
+            contextResult.memoryFiles,
+            agentOutput,
+            true, // success
+            secureFs as Parameters<typeof recordMemoryUsage>[4]
+          );
+        }
+
+        // Extract and record learnings from the agent output
+        await this.recordLearningsFromFeature(projectPath, feature, agentOutput);
+      } catch (learningError) {
+        console.warn('[AutoMode] Failed to record learnings:', learningError);
+      }
 
       this.emitAutoModeEvent('auto_mode_feature_complete', {
         featureId,
@@ -2744,5 +2780,113 @@ Begin implementing task ${task.id} now.`;
         );
       }
     });
+  }
+
+  /**
+   * Extract and record learnings from a completed feature
+   * Uses a quick Claude call to identify important decisions and patterns
+   */
+  private async recordLearningsFromFeature(
+    projectPath: string,
+    feature: Feature,
+    agentOutput: string
+  ): Promise<void> {
+    if (!agentOutput || agentOutput.length < 100) {
+      // Not enough output to extract learnings from
+      return;
+    }
+
+    // Limit output to avoid token limits
+    const truncatedOutput = agentOutput.length > 10000 ? agentOutput.slice(-10000) : agentOutput;
+
+    const userPrompt = `Based on implementing "${feature.title}", identify any important learnings.
+
+Look for:
+1. DECISIONS made that future developers should understand (architecture, library choices, patterns)
+2. GOTCHAS or edge cases encountered that should be avoided
+3. PATTERNS that worked well and should be reused
+
+For each finding, respond with JSON:
+{
+  "learnings": [
+    {
+      "category": "architecture|api|ui|terminals|auth|testing|gotchas",
+      "type": "decision|gotcha|pattern|learning",
+      "content": "Brief description",
+      "why": "For decisions: why this choice was made",
+      "rejected": "For decisions: what alternative was rejected",
+      "breaking": "For decisions: what would break if changed"
+    }
+  ]
+}
+
+Only include genuinely useful, non-obvious learnings. Return {"learnings": []} if nothing notable.
+
+Feature context:
+${truncatedOutput}`;
+
+    try {
+      // Import query dynamically to avoid circular dependencies
+      const { query } = await import('@anthropic-ai/claude-agent-sdk');
+      const { CLAUDE_MODEL_MAP } = await import('@automaker/model-resolver');
+
+      // Use a quick model for extraction
+      const stream = query({
+        prompt: userPrompt,
+        options: {
+          model: CLAUDE_MODEL_MAP.haiku,
+          maxTurns: 1,
+          allowedTools: [],
+          permissionMode: 'acceptEdits',
+        },
+      });
+
+      // Extract text from stream
+      let responseText = '';
+      for await (const msg of stream) {
+        if (msg.type === 'assistant' && msg.message?.content) {
+          for (const block of msg.message.content) {
+            if (block.type === 'text' && block.text) {
+              responseText += block.text;
+            }
+          }
+        } else if (msg.type === 'result' && msg.subtype === 'success') {
+          responseText = msg.result || responseText;
+        }
+      }
+
+      // Parse the response
+      const jsonMatch = responseText.match(/\{[\s\S]*"learnings"[\s\S]*\}/);
+      if (!jsonMatch) return;
+
+      const parsed = JSON.parse(jsonMatch[0]);
+      if (!parsed.learnings || !Array.isArray(parsed.learnings)) return;
+
+      // Record each learning
+      for (const learning of parsed.learnings) {
+        if (!learning.category || !learning.content) continue;
+
+        await appendLearning(
+          projectPath,
+          {
+            category: learning.category,
+            type: learning.type || 'learning',
+            content: learning.content,
+            why: learning.why,
+            rejected: learning.rejected,
+            breaking: learning.breaking,
+          },
+          secureFs as Parameters<typeof appendLearning>[2]
+        );
+      }
+
+      if (parsed.learnings.length > 0) {
+        console.log(
+          `[AutoMode] Recorded ${parsed.learnings.length} learning(s) from feature ${feature.id}`
+        );
+      }
+    } catch (error) {
+      console.warn('[AutoMode] Failed to extract learnings:', error);
+    }
   }
 }

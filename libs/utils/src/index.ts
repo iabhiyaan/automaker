@@ -56,4 +56,27 @@ export {
   type ContextFileInfo,
   type ContextFilesResult,
   type LoadContextFilesOptions,
+  type MemoryFileInfo,
 } from './context-loader.js';
+
+// Memory loading
+export {
+  loadRelevantMemory,
+  initializeMemoryFolder,
+  appendLearning,
+  recordMemoryUsage,
+  getMemoryDir,
+  parseFrontmatter,
+  serializeFrontmatter,
+  extractTerms,
+  calculateUsageScore,
+  incrementUsageStat,
+  formatLearning,
+  type MemoryFsModule,
+  type MemoryMetadata,
+  type MemoryFile,
+  type MemoryLoadResult,
+  type UsageStats,
+  type LearningEntry,
+  type SimpleMemoryFile,
+} from './memory-loader.js';
